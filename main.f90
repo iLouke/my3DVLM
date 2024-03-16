@@ -9,8 +9,11 @@ program main
     type(Panel_), allocatable :: panel(:)
     type(Configuration)       :: setting
     ! Allocatable Arrays
-    real(8), allocatable :: A  (:,:)    ! AIC Matrix            (N_panels **2)
-    real(8), allocatable :: DW (:,:)    ! Downwash Matrix       ()
+    real(8), allocatable :: A     (:,:)    ! AIC Matrix            (N_panels **2)
+    real(8), allocatable :: B     (:,:)    ! DownWash              (N_panels **2)
+    real(8), allocatable :: GAMA  (:)      ! Vortex Strength       (N_panels)
+    real(8), allocatable :: RHS   (:)      ! RHS                   (N_panels)
+    real(8), allocatable :: GAMAw (:,:)    ! Wake Panel Strength   (max_iter, N_panels_wake)
 
     ! Variables for Computations
     real(8) :: Lift = 0.d0, Drag = 0.d0
@@ -20,7 +23,7 @@ program main
     real(8) :: time = 0.d0
     ! Counters
     integer :: iteration = 0, max_iterations = 100   
-    integer :: i,j,k,l,m
+    integer :: i,j,k,l,m, cmax, c, p1,p2
     ! Variables for System
     real    :: CPU_start = 0., CPU_end = 0., CPU_run = 0.
 
@@ -32,28 +35,26 @@ program main
     call read_inputs(setting)
     ! As the input file is read, we allocate memory needed for panels
     allocate(panel(setting%npanels))
+    allocate(A(setting%npanels, setting%npanels))
+    allocate(B(setting%npanels, setting%npanels))
+    allocate(GAMA(setting%npanels))
+    allocate(RHS(setting%npanels))
     ! Reading of geometry
     call read_geometry(setting,panel)
     ! Set timestep (dt) as dt = dx / vinit / 4.d0 
     ! where dx is the biggest panel edge found in geometry mesh (calculated in read_geometry)
     call timestep_calc()
 
+    ! Starting Loop
+    do iteration = 1, max_iterations
+
+        call vorcalc(iteration,setting%npanels,panel, &
+        & A,B,GAMA,RHS,setting%symmetry,setting%grnd_eff,setting%vinit)
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    end do
+    
+    
     call cpu_time(CPU_end)
     CPU_run = CPU_end - CPU_run
     write (6,100) CPU_run/60., CPU_run  ! Writes on screen the runtime of solver
@@ -208,3 +209,170 @@ function count_lines(filename) result(nlines)
 
     close(10)
 end function count_lines
+
+subroutine vorcalc(iter,n,p,A,B,GAMA,RHS,sym,grnd,vinit)
+    use panel_3d
+    implicit none
+    integer     , intent(in)   :: iter, n, sym, grnd
+    real(8)     , intent(in)   :: vinit
+    type(Panel_), intent(in)   :: p(n)
+    real(8)     ,intent(inout) :: A(n,n),B(n,n),GAMA(n),RHS(n)
+    integer :: i,j,c,c1,c2, cmax
+    real(8) ::       u,      v,      w
+    real(8) ::    sumU,   sumV,   sumW
+    real(8) ::  s_sumU, s_sumV, s_sumW
+    real(8)  :: w_sumU, w_sumV, w_sumW
+    real(8) :: x,y,z, x1,x2,y1,y2,z1,z2
+
+    GAMA = 0.d0; RHS = 0.d0
+
+    ! If it is the first iteration then the A matrix should be computed
+    if (iter == 1) then
+        A = 0.d0; B = 0.d0
+        do i = 1,n
+            x = p(i)%cp(1)
+            y = p(i)%cp(2)
+            z = p(i)%cp(3)
+            do j = 1,n
+
+                  sumU = 0.d0;   sumV = 0.d0;   sumW = 0.d0
+                s_sumU = 0.d0; s_sumV = 0.d0; s_sumW = 0.d0
+                if (p(j)%is_triangle) then
+                    cmax = 3
+                else
+                    cmax = 4
+                end if
+
+
+                do c = 1, cmax
+                    c1 = c
+                    c2 = c + 1
+                    if (c2 == cmax + 1) c2 =1
+
+                    x1 = p(j)%x(c1); y1 = p(j)%y(c1); z1 = p(j)%z(c1);
+                    x2 = p(j)%x(c2); y2 = p(j)%y(c2); z2 = p(j)%z(c2);
+
+                    call vortex(x,y,z,x1,y2,z1,x2,y2,z2,1.d0,u,v,w)
+
+                    sumU = sumU + u; sumV = sumV + v; sumW = sumW + w;
+                end do
+                ! Symmetry Half
+                if (sym==1) then
+                    do c = 1, cmax
+                        c1 = c
+                        c2 = c + 1
+                        if (c2 == cmax + 1) c2 =1
+                        x1 = p(j)%x(c1); y1 = p(j)%y(c1); z1 = p(j)%z(c1);
+                        x2 = p(j)%x(c2); y2 = p(j)%y(c2); z2 = p(j)%z(c2);
+    
+                        call vortex(x,-y,z,x1,y2,z1,x2,y2,z2,1.d0,u,v,w)
+    
+                        sumU = sumU + u; sumV = sumV - v; sumW = sumW + w;
+                    end do
+                end if
+                ! Ground Mirror Image
+                if (grnd==1) then
+                    do c = 1, cmax
+                        c1 = c
+                        c2 = c + 1
+                        if (c2 == cmax + 1) c2 =1
+                        x1 = p(j)%x(c1); y1 = p(j)%y(c1); z1 = p(j)%z(c1);
+                        x2 = p(j)%x(c2); y2 = p(j)%y(c2); z2 = p(j)%z(c2);
+    
+                        call vortex(x,y,-z,x1,y2,z1,x2,y2,z2,1.d0,u,v,w)
+    
+                        sumU = sumU + u; sumV = sumV + v; sumW = sumW - w;
+                    end do
+                end if
+                ! Symmetry Ground Mirror Image
+                if (grnd==1) then
+                    do c = 1, cmax
+                        c1 = c
+                        c2 = c + 1
+                        if (c2 == cmax + 1) c2 =1
+                        x1 = p(j)%x(c1); y1 = p(j)%y(c1); z1 = p(j)%z(c1);
+                        x2 = p(j)%x(c2); y2 = p(j)%y(c2); z2 = p(j)%z(c2);
+    
+                        call vortex(x,-y,-z,x1,y2,z1,x2,y2,z2,1.d0,u,v,w)
+    
+                        sumU = sumU + u; sumV = sumV - v; sumW = sumW - w;
+                    end do
+                end if
+
+                ! Sum up all the induced velocities
+                A(i,j) = A(i,j) + p(i)%norm(1)*sumU + p(i)%norm(2)*sumV + p(i)%norm(3)*sumW
+            end do
+            RHS(i) = - (Vinit*p(i)%norm(1))
+        end do
+    else
+        do i = 1, n
+            x = p(i)%cp(1)
+            y = p(i)%cp(2)
+            z = p(i)%cp(3)
+
+            w_sumU = 0.d0; w_sumV = 0.d0; w_sumW = 0.d0
+            
+            ! Add wake influence
+            print *, 'NO WAKE INFLUENCE CALC IN VORCALC'
+
+
+            RHS(i) = -(    Vinit*p(i)%norm(1) &
+            &           + w_sumU*p(i)%norm(1) &
+            &           + w_sumV*p(i)%norm(2) &
+            &           + w_sumW*p(i)%norm(3) )
+        end do
+    end if
+
+    ! Solve for Gamma
+    GAMA = RHS
+    call solve_axb(A,n,GAMA)
+end subroutine vorcalc
+
+subroutine solve_axb(a, n, b)
+    implicit none
+    integer, intent(in) :: n
+    real(8), dimension(n, n), intent(in)    :: a
+    real(8), dimension(n)   , intent(inout) :: b
+  
+    integer :: info
+    real(8), dimension(n) :: ipiv(n)
+    ! Call DGESV to solve the system AX = B. X is saved in B
+    call dgesv(n,1,a,n,ipiv,b,n,info)
+    if (info .ne. 0) then
+      print *, 'Error in dgesv: ', info
+      ! Handle the error appropriately
+    end if
+end subroutine solve_axb
+
+
+subroutine vortex(X,Y,Z,X1,Y1,Z1,X2,Y2,Z2,GAMA,U,V,W)
+    implicit double precision (A-Z)
+    ! SUBROUTINE VORTEX CALCULATES THE INDUCED VELOCITY (U,V,W) AT A POI
+    ! (X,Y,Z) DUE TO A VORTEX ELEMENT VITH STRENGTH GAMA PER UNIT LENGTH
+    ! POINTING TO THE DIRECTION (X2,Y2,Z2)-(sX1,Y1,Z1).
+    PAY = 4.d0*atan(1.d0)
+    RCUT=1.0E-10
+    ! CALCULATION OF R1 X R2
+    R1R2X=(Y-Y1)*(Z-Z2)-(Z-Z1)*(Y-Y2)
+    R1R2Y=-((X-X1)*(Z-Z2)-(Z-Z1)*(X-X2))
+    R1R2Z=(X-X1)*(Y-Y2)-(Y-Y1)*(X-X2)
+    ! CALCULATION OF (R1 X R2 )**2
+    SQUARE=R1R2X*R1R2X+R1R2Y*R1R2Y+R1R2Z*R1R2Z
+    ! CALCULATION OF R0(R1/R(R1)-R2/R(R2))
+    R1=SQRT((X-X1)*(X-X1)+(Y-Y1)*(Y-Y1)+(Z-Z1)*(Z-Z1))
+    R2=SQRT((X-X2)*(X-X2)+(Y-Y2)*(Y-Y2)+(Z-Z2)*(Z-Z2))
+    IF((R1.LT.RCUT).OR.(R2.LT.RCUT).OR.(SQUARE.LT.RCUT)) GOTO 1 !GROUND
+    R0R1=(X2-X1)*(X-X1)+(Y2-Y1)*(Y-Y1)+(Z2-Z1)*(Z-Z1)
+    R0R2=(X2-X1)*(X-X2)+(Y2-Y1)*(Y-Y2)+(Z2-Z1)*(Z-Z2)
+    COEF=GAMA/(4.0*PAY*SQUARE)*(R0R1/R1-R0R2/R2)
+    U=R1R2X*COEF
+    V=R1R2Y*COEF
+    W=R1R2Z*COEF
+    GOTO 2
+    ! WHEN POINT (X,Y,Z) LIES ON VORTEX ELEMENT; ITS INDUCED VELOCITY IS
+    1 U=0.
+    V=0.
+    W=0.
+    2 CONTINUE
+    RETURN
+end subroutine vortex
